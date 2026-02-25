@@ -1,0 +1,22 @@
+# Environments
+.env
+
+# Folders generated
+output/
+temp/
+__pycache__/
+*.pyc
+*.pyo
+
+# Executables (if not wanted)
+ffmpeg.exe
+ffprobe.exe
+
+# Video / Audio / text logs
+*.mp4
+*.mp3
+# temas_usados.txt - Descomente se quiser ignorar os temas usados
+
+# VS Code / IDE
+.vscode/
+.idea/
