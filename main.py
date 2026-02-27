@@ -11,6 +11,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
 import yt_dlp
+from card_generator import generate_frames_for_clip
+import imageio_ffmpeg
 
 load_dotenv()
 
@@ -18,7 +20,7 @@ BASE_DIR = Path(__file__).parent.absolute()
 TEMP_DIR = BASE_DIR / "temp"
 OUTPUT_DIR = BASE_DIR / "output"
 HISTORY_FILE = BASE_DIR / "temas_usados.txt"
-FFMPEG_EXE = str(BASE_DIR / "ffmpeg.exe")
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 # Garantir que as pastas existam
 for d in [TEMP_DIR, OUTPUT_DIR]:
@@ -64,48 +66,49 @@ async def generate_tts_audio(text, output_file):
     communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural", rate="+25%")
     await communicate.save(output_file)
 
-def create_intro_video(theme_title, out_path):
-    """Cria um vídeo de intro com fundo preto, título e narração."""
-    print(f"[*] Criando INTRO para: {theme_title}")
+def create_intro_video(theme_title, hook_text, out_path, bg_video=None):
+    """Cria um vídeo de intro com título, gancho narrado e fundo dinâmico."""
+    print(f"[*] Criando INTRO com HOOK: {hook_text}")
     
-    # 1. Gerar o áudio da narração
+    # 1. Gerar o áudio da narração (Theme + Hook)
     audio_path = str(TEMP_DIR / "intro_audio.mp3")
-    text_to_say = f"Here is the {theme_title}. Let's go!"
+    text_to_say = f"{theme_title}. {hook_text}"
     asyncio.run(generate_tts_audio(text_to_say, audio_path))
     
-    # 2. Criar filtros de texto para o título
-    title_lines = wrap_text_for_ffmpeg(theme_title.upper(), max_chars=20)
-    draw_text_filters = ""
-    start_y = 700 # Centralizado verticalmente (aprox)
-    font_size = 75
-    line_height = 90
+    # 2. Filtros de texto
+    title_lines = wrap_text_for_ffmpeg(theme_title.upper(), max_chars=15)
+    hook_lines = wrap_text_for_ffmpeg(hook_text.upper(), max_chars=20)
     
+    draw_filters = ""
+    # Título (Cima)
     for i, line in enumerate(title_lines):
         safe_line = escape_ffmpeg_text(line)
-        y_pos = start_y + (i * line_height)
-        draw_text_filters += (
-            f",drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{safe_line}':"
-            f"fontcolor=yellow:fontsize={font_size}:x=(w-text_w)/2:y={y_pos}:"
-            f"box=1:boxcolor=black@0.0:borderw=3:bordercolor=black" # Sem box, só borda grossa
-        )
+        draw_filters += (f",drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{safe_line}':"
+                         f"fontcolor=yellow:fontsize=80:x=(w-text_w)/2:y=600+({i}*100):borderw=4")
+    
+    # Hook (Meio/Baixo)
+    for i, line in enumerate(hook_lines):
+        safe_line = escape_ffmpeg_text(line)
+        draw_filters += (f",drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{safe_line}':"
+                         f"fontcolor=white:fontsize=65:x=(w-text_w)/2:y=1100+({i}*80):borderw=4")
 
-    # 3. Gerar vídeo com FFmpeg
-    # -f lavfi -i color=c=black:s=1080x1920: Cria fundo preto
-    # -shortest: O vídeo dura o tempo do áudio
+    # 3. Configurar entrada de vídeo
+    if bg_video and Path(bg_video).exists():
+        v_input = ["-i", str(bg_video)]
+        v_filter = f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:(iw-ow)/2:(ih-oh)/2,boxblur=25:25,colorchannelmixer=rr=0.5:gg=0.5:bb=0.5{draw_filters}[v]"
+    else:
+        v_input = ["-f", "lavfi", "-i", "color=c=black:s=1080x1920"]
+        v_filter = f"[0:v]setsar=1{draw_filters}[v]"
+
     cmd = [
         FFMPEG_EXE, "-y",
-        "-f", "lavfi", "-i", "color=c=black:s=1080x1920",
+        *v_input,
         "-i", audio_path,
-        "-filter_complex", 
-        f"[0:v]setsar=1{draw_text_filters}[v];[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]",
+        "-filter_complex", f"{v_filter};[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]",
         "-map", "[v]", "-map", "[a]",
-        "-shortest", # Corta o vídeo quando o áudio acaba
-        
-        # Encoding padrão (IGUAL AOS OUTROS CLIPES)
-        "-c:v", "libx264", "-r", "30", "-g", "60", "-sc_threshold", "0", 
-        "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
-        str(out_path)
+        "-shortest",
+        "-c:v", "libx264", "-r", "30", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "22",
+        "-c:a", "aac", "-b:a", "192k", str(out_path)
     ]
     
     subprocess.run(cmd, check=True)
@@ -117,49 +120,62 @@ def generate_ranking_data():
     history = load_history()
     history_str = "\n".join([f"- {h}" for h in history[-20:]])
     
-    print("[*] Pedindo para a IA (GROQ) criar um tema e um ranking musical (TOP 10)...")
+    print("[*] Pedindo para a IA criar um tema, ranking e um HOOK viral...")
+    
+    # Lista de modelos para fallback caso um falhe ou esteja congestionado
+    models_to_try = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "mixtral-8x7b-32768",
+        "llama3-70b-8192"
+    ]
+    
     prompt = f"""
-    Act as an expert viral video producer for TikTok/Shorts and a STRICT Music Historian. 
-    You create engaging "Top 10" music rankings. Content must be in ENGLISH.
+    Act as a STRICT Music Historian and Viral Producer. 
+    Your goal is to create a "Top 10" or "Top 5" ranking based on 100% REAL and VERIFIED data.
     
-    CRITICAL INSTRUCTION: VERACITY IS PARAMOUNT.
-    - Do NOT hallucinate stats.
-    - Use ONLY well-established facts (Billboard, RIAA, Spotify, Guinness).
-    - PREFER themes based on VISUAL content (Music Videos) rather than abstract stats (Sales).
+    CRITICAL CONSTRAINTS:
+    - DATA VERACITY: Do NOT hallucinate. Use data from Billboard, RIAA, Guinness World Records, or official YouTube/Spotify counts.
+    - THEME: Must be music-related and visual (must have a Music Video).
+    - ITEMS: Each item MUST include "artist", "song", and the exact "stat" (e.g., "3.2 Billion Views", "14 Weeks at #1").
+    - STARTING HOOK: Create a "hook_text" that references the data (e.g., "These numbers are legendary!").
     
-    PREVIOUSLY USED THEMES (DO NOT REPEAT):
+    PREVIOUSLY USED (DO NOT REPEAT):
     {history_str}
     
-    Create a new "Top 10" music theme. 
-    Examples: "Top 10 Most Expensive Music Videos", "Top 10 Most Viewed Rock Songs", "Top 10 Iconic 2000s Pop Videos".
-    
-    Format EXACTLY in JSON. Return ONLY the JSON:
+    Return ONLY JSON:
     {{
-      "theme_title": "TOP 10 MOST EXPENSIVE MUSIC VIDEOS",
+      "theme_title": "TOP 10 MOST CERTIFIED SONGS (RIAA)",
+      "hook_text": "The winner has 15 Diamond certifications!",
       "ranking": [
          {{
             "rank": 10,
             "artist": "Artist Name",
             "song": "Song Name",
-            "stat": "Stat Description"
+            "stat": "11x Platinum"
          }}
-      ] 
-      // You MUST fill exactly 10 positions (Rank 10 down to 1).
+      ]
     }}
     """
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        res = chat_completion.choices[0].message.content
-        txt = res.replace('```json', '').replace('```', '').strip()
-        return json.loads(txt)
-    except Exception as e:
-        print(f"[!] Erro ao usar a Groq: {e}")
-        return {"theme_title": "Error", "ranking": []}
+    
+    for model_name in models_to_try:
+        try:
+            print(f"[*] Tentando modelo: {model_name}...")
+            chat_completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_name,
+            )
+            res = chat_completion.choices[0].message.content
+            txt = res.replace('```json', '').replace('```', '').strip()
+            return json.loads(txt)
+        except Exception as e:
+            print(f"[!] Erro com o modelo {model_name}: {e}")
+            continue # Tenta o próximo modelo
+            
+    print("[!] Todos os modelos de IA falharam.")
+    return {"theme_title": "Error", "ranking": [], "hook_text": "Let's find out!"}
 
-def download_video_trecho(artist, song, out_path):
+def download_video_trecho(artist, song, out_path, duration_sec=7):
     search_query = f"{artist} - {song} Official Music Video"
     print(f"[*] Buscando Oficial no YouTube: '{search_query}'")
     
@@ -180,33 +196,43 @@ def download_video_trecho(artist, song, out_path):
                 for entry in info['entries']:
                     if not entry: continue
                     title_lower = entry.get('title', '').lower()
+                    channel_lower = entry.get('uploader', '').lower()
                     
                     score = 0
-                    if "official" in title_lower: score += 5
-                    if "video" in title_lower: score += 2
-                    if "review" in title_lower: score -= 100
-                    if "reaction" in title_lower: score -= 100
-                    if "cover" in title_lower: score -= 50
-                    if "lyrics" in title_lower: score -= 20
+                    # Bonus por canal oficial e VEVO
+                    if "vevo" in channel_lower or channel_lower.endswith("- topic"): score += 50
+                    if artist.lower() in channel_lower: score += 30
+                    
+                    # Bonus por título exato
+                    if "official" in title_lower: score += 20
+                    if song.lower() in title_lower: score += 20
+                    if "video" in title_lower or "music" in title_lower: score += 10
+                    
+                    # Penalidades severas para evitar lixo
+                    if any(x in title_lower for x in ["review", "reaction", "cover", "lyrics", "live", "fan-made", "parody", "karaoke", "remix"]):
+                        score -= 200
+                    if any(x in channel_lower for x in ["reaction", "lyrics"]):
+                        score -= 150
                     
                     candidates.append((score, entry))
             
             if not candidates:
                 print("[!] Nenhum video valido encontrado.")
-                return None
+                return None, None
                 
+            # Seleciona o que tiver o score mais alto
             best_video = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
-            print(f"    -> Selecionado: {best_video['title']} (Score calculado)")
+            print(f"    -> Selecionado: {best_video['title']} [Score: {sorted(candidates, key=lambda x: x[0], reverse=True)[0][0]}]")
             
             target_url = best_video['webpage_url']
             duration = best_video.get('duration', 180)
             
         except Exception as e:
             print(f"[!] Erro ao buscar: {e}")
-            return None
+            return None, None
 
     start_time = max(0, int(duration * 0.35))
-    end_time = start_time + 5 
+    end_time = start_time + duration_sec
     
     print(f"[*] Baixando trecho (de {start_time}s até {end_time}s)...")
     
@@ -216,7 +242,7 @@ def download_video_trecho(artist, song, out_path):
         "--download-sections", f"*{start_time}-{end_time}",
         "--force-keyframes-at-cuts",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--ffmpeg-location", str(BASE_DIR),
+        "--ffmpeg-location", FFMPEG_EXE,
         "-o", str(out_path),
         target_url
     ]
@@ -225,8 +251,15 @@ def download_video_trecho(artist, song, out_path):
     
     arquivos_possiveis = list(Path(out_path).parent.glob(out_path.name + "*"))
     if arquivos_possiveis:
-        return arquivos_possiveis[0]
-    return out_path
+        baixado = arquivos_possiveis[0]
+        # Extrair thumbnail (primeiro frame)
+        thumb_path = out_path.with_suffix('.jpg')
+        cmd_thumb = [
+            FFMPEG_EXE, "-y", "-i", str(baixado), "-vframes", "1", "-q:v", "2", str(thumb_path)
+        ]
+        subprocess.run(cmd_thumb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return baixado, thumb_path
+    return out_path, None
 
 def create_text_filter(text, font_size, y_start, color="white", box_color="black@0.6", border_w=3):
     max_chars = 25
@@ -254,33 +287,42 @@ def create_text_filter(text, font_size, y_start, color="white", box_color="black
         )
     return filters
 
-def criar_trecho_video(video_orig, theme_title, rank_info, out_path):
-    rank = rank_info['rank']
-    artist = rank_info['artist']
-    song = rank_info['song']
-    stat = rank_info['stat']
-
-    title_filter = create_text_filter(theme_title.upper(), 60, 120, box_color="black@0.7")
-    artist_filter = create_text_filter(f"{artist} - {song}", 55, "(h-text_h)/2+200", box_color="black@0.6")
-    stat_filter = create_text_filter(f"({stat})", 50, "(h-text_h)/2+350", color="0x00FF00", box_color="black@0.6")
-    safe_rank = f"#{rank}"
+def criar_trecho_video(video_orig, theme_title, rank_info, out_path, thumb_path, start_offset=0):
+    print(f"[*] Extraindo frames do vídeo para animação circular (start: {start_offset}s)...")
+    video_frames_dir = TEMP_DIR / f"video_frames_{rank_info['rank']}"
+    video_frames_dir.mkdir(exist_ok=True)
     
-    # ATENÇÃO: [0:a]loudnorm=I=-16:TP=-1.5:LRA=11[a] -> Normaliza o áudio para -16LUFS (Padrão mobile)
+    cmd_extract = [
+        FFMPEG_EXE, "-y", "-ss", str(start_offset), "-i", str(video_orig),
+        "-t", "7.0",
+        "-vf", "fps=30,crop='min(iw,ih)':'min(iw,ih)',scale=300:300",
+        "-q:v", "2", str(video_frames_dir / "thumb_%04d.jpg")
+    ]
+    subprocess.run(cmd_extract, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print(f"[*] Gerando UI Cards animados para #{rank_info['rank']}...")
+    frames_dir = generate_frames_for_clip(TEMP_DIR, rank_info, theme_title, video_frames_dir=video_frames_dir, duration=7.0, fps=30)
+    
+    # Sequence de imagens
+    frames_input = str(Path(frames_dir) / "frame_%04d.png").replace('\\', '/')
+    
+    # Fundo do vídeo (blur e escurecimento + Fade)
     v_filter = (
-        f"scale=1080:1920:force_original_aspect_ratio=increase,"
+        f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
         f"crop=1080:1920:(iw-ow)/2:(ih-oh)/2,"
         f"setsar=1," 
-        f"colorchannelmixer=rr=0.5:gg=0.5:bb=0.5" 
-        f"{title_filter}"
-        f",drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{safe_rank}':fontcolor=yellow:fontsize=180:x=(w-text_w)/2:y=(h-text_h)/2-150:borderw=8:bordercolor=black"
-        f"{artist_filter}"
-        f"{stat_filter}"
+        f"boxblur=20:20,"
+        f"colorchannelmixer=rr=0.4:gg=0.4:bb=0.4,"
+        f"fade=t=in:st=0:d=0.5,fade=t=out:st=6.5:d=0.5[bg];" # Fades de 0.5s
+        f"[1:v]scale=1080:1920,fade=t=in:st=0:d=0.5,fade=t=out:st=6.5:d=0.5[overlay];"
+        f"[bg][overlay]overlay=0:0[v]"
     )
 
     cmd = [
         FFMPEG_EXE, "-y", 
-        "-t", "5.0", "-i", str(video_orig),
-        "-filter_complex", f"[0:v]{v_filter}[v];[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]", 
+        "-ss", str(start_offset), "-t", "7.0", "-i", str(video_orig),
+        "-framerate", "30", "-i", frames_input, # Imagens do card
+        "-filter_complex", f"{v_filter};[0:a]afade=t=in:st=0:d=0.5,afade=t=out:st=6.5:d=0.5,loudnorm=I=-16:TP=-1.5:LRA=11[a]", 
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-r", "30", "-g", "60", "-sc_threshold", "0", 
         "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "20",
@@ -306,47 +348,74 @@ def main():
     print(f"\n🎼 TEMA: {theme_title}")
     save_history(theme_title)
     
-    arquivos_trecho = []
+    arquivos_ranking = []
+    video_para_intro = None
+    arquivos_finais = []
     
-    # 1. GERA A INTRO
-    try:
-        intro_path = TEMP_DIR / "intro_final.mp4"
-        create_intro_video(theme_title, intro_path)
-        if intro_path.exists():
-            arquivos_trecho.append(intro_path)
-    except Exception as e:
-        print(f"[!] Erro ao criar intro: {e}")
-
-    # 2. GERA OS CLIPES
+    # 1. GERA OS CLIPES DO RANKING PRIMEIRO
+    # Garantir que o rank seja inteiro para ordenação correta
+    for item in ranking:
+        try:
+            item['rank'] = int(item['rank'])
+        except:
+            pass
+            
     ranks = sorted(ranking, key=lambda x: x['rank'], reverse=True)
+    
+    primeiro_processado = True
+    intro_duration = 4.0
     
     for r in ranks:
         pos = r['rank']
         print(f"\n[*] Processando #{pos}: {r['artist']} - {r['song']}")
         
         vid_bruto = TEMP_DIR / f"bruto_{pos}.mp4"
-        baixado = download_video_trecho(r['artist'], r['song'], vid_bruto)
+        
+        # Se for o primeiro (ex: #10), baixar tempo extra para a intro
+        duracao_download = 7 + intro_duration if primeiro_processado else 7
+        baixado, thumb_path = download_video_trecho(r['artist'], r['song'], vid_bruto, duration_sec=duracao_download)
         
         if not baixado or not Path(baixado).exists():
             print(f"[!] Falha ao baixar #{pos}. Ignorando.")
             continue
             
+        # O primeiro vídeo baixado será usado como fundo da intro (take contínuo)
+        if primeiro_processado:
+            video_para_intro = baixado
+            # Criar a intro usando os primeiros segundos do primeiro clipe
+            try:
+                hook_text = dados.get('hook_text', "Wait until you see #1!")
+                intro_path = TEMP_DIR / "intro_final.mp4"
+                # A intro só usa o início do vídeo
+                create_intro_video(theme_title, hook_text, intro_path, bg_video=video_para_intro)
+                if intro_path.exists():
+                    arquivos_finais.append(intro_path)
+            except Exception as e:
+                print(f"[!] Erro ao criar intro dinâmica: {e}")
+
         vid_pronto = TEMP_DIR / f"pronto_{pos}.mp4"
         try:
-            criar_trecho_video(baixado, theme_title, r, vid_pronto)
+            # Se for o primeiro, o clipe do ranking começa após a intro
+            offset = intro_duration if primeiro_processado else 0
+            criar_trecho_video(baixado, theme_title, r, vid_pronto, thumb_path, start_offset=offset)
             if vid_pronto.exists():
-                arquivos_trecho.append(vid_pronto)
+                arquivos_ranking.append(vid_pronto)
         except Exception as e:
             print(f"[!] Erro ao processar video #{pos}: {e}")
+            
+        primeiro_processado = False
+
+    # Adiciona os clipes do ranking após a intro já adicionada
+    arquivos_finais.extend(arquivos_ranking)
         
-    if not arquivos_trecho:
+    if not arquivos_finais:
         print("[!] Nenhum video gerado.")
         return
         
-    print("\n[*] 🎞️ Unindo tudo (Intro + Ranking)...")
+    print("\n[*] 🎞️ Unindo tudo (Intro Dinâmica + Ranking)...")
     concat_txt = TEMP_DIR / "concat.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
-        for p in arquivos_trecho:
+        for p in arquivos_finais:
             safe_path = str(p.name)
             f.write(f"file '{safe_path}'\n")
             

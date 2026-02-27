@@ -2,3 +2,5 @@ groq
 python-dotenv
 yt-dlp
 edge-tts
+Pillow
+imageio-ffmpeg
